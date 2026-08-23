@@ -184,11 +184,30 @@ export function buildAll(srcDir = SRC, outDir = OUT) {
   return pages;
 }
 
+/**
+ * The site root. §22 puts every explainer at `<hub>/surfaces/`, and Cloudflare Pages serves a
+ * project at the domain root — so the hub is built INTO a `surfaces/` subdirectory rather than
+ * the spec being bent to match the host. The root page is what someone typing the bare domain
+ * gets; a 404 there would be a worse answer than a short one.
+ */
+function rootPage() {
+  return page(
+    "Monkstone",
+    `<h1>Monkstone</h1>
+<p>A technology lab.</p>
+<p><a href="/surfaces/">Surfaces</a> — every opportunity investigated, including the ones killed. The research is published either way.</p>`,
+    "/",
+  );
+}
+
 if (process.argv[1]?.endsWith("build.mjs")) {
   try {
-    const pages = buildAll();
-    for (const p of pages) console.log(`  ${p.slug}.md → ${p.slug}/index.html`);
-    console.log(`\n  ${pages.length} explainer(s) → ${OUT}/`);
+    const hub = join(OUT, "surfaces");
+    const pages = buildAll(SRC, hub);
+    mkdirSync(OUT, { recursive: true });
+    writeFileSync(join(OUT, "index.html"), rootPage());
+    for (const p of pages) console.log(`  ${p.slug}.md → surfaces/${p.slug}/index.html`);
+    console.log(`\n  ${pages.length} explainer(s) → ${OUT}/surfaces/ · root page → ${OUT}/index.html`);
   } catch (e) {
     console.error(`❌ ${e.message}`);
     process.exit(1);
