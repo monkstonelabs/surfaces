@@ -113,7 +113,186 @@ export function render(md) {
   return out.join("\n");
 }
 
-const page = (title, body, canonical) => `<!doctype html>
+// ---------------------------------------------------------------------------
+// Scrollytelling (P15.10, §22)
+// ---------------------------------------------------------------------------
+//
+// §22: "Prose is commodity; a built visual explainer is not." A scrollytelling section pins one
+// graphic and steps text past it, swapping the graphic as each step arrives — The Pudding's
+// pattern.
+//
+// **NO LIBRARY, AND THAT IS THE §22 CONSTRAINT RATHER THAN A PREFERENCE.** The AC is "single-file
+// HTML … with no CMS and no framework added", and the checklist names Scrollama and GSAP
+// ScrollTrigger. Both were considered and neither is added:
+//
+//   Scrollama          is an `IntersectionObserver` wrapper. Its entire useful surface here —
+//                      observe the steps, tell me which one is current — is the twenty lines
+//                      inlined below, and a single-file output would have to inline the library
+//                      anyway. Vendoring 3KB of someone else's minified code to avoid writing
+//                      twenty lines is a supply-chain surface and a version to chase, against
+//                      this file's own rule that it must still build in five years unmaintained.
+//   GSAP ScrollTrigger is for pinning. `position: sticky` is native CSS, does exactly this job,
+//                      and has been baseline for years.
+//
+// **IT DEGRADES TO PROSE WITH NO JAVASCRIPT.** The first figure is active by CSS alone and every
+// step's text renders in order, so the page is readable — which matters more here than anywhere
+// else in this repo, because §22 says an explainer lives at its URL forever and JavaScript is the
+// part most likely to stop working first.
+//
+// SYNTAX, line-based on purpose so the parser stays a `for` loop:
+//
+//     :::scrolly
+//     :::figure key
+//     <svg …>            ← raw, see the refusal below
+//     :::step key
+//     Prose for this step, in markdown.
+//     :::step other-key
+//     More prose.
+//     :::
+//
+const SCROLLY_OPEN = /^:::scrolly\s*$/;
+const SCROLLY_DIRECTIVE = /^:::(figure|step)\s+([A-Za-z0-9_-]+)\s*$/;
+const SCROLLY_CLOSE = /^:::\s*$/;
+
+/**
+ * Figure content is emitted RAW, because an SVG is the point and escaping it would print angle
+ * brackets. That is a deliberate hole in this file's otherwise total escaping, so it is bounded:
+ *
+ * **A figure carrying a script, an inline event handler or a `javascript:` URL FAILS THE BUILD.**
+ * Explainers are written by `surface-explainer` from ingested content (§4 — all of it untrusted),
+ * committed, and served from the hub's own origin. A raw-HTML passthrough on that path is an
+ * XSS on our own domain, and "we review explainers before committing them" is a process, not a
+ * control. This is the control.
+ */
+const FIGURE_FORBIDDEN = /<\s*script|\son[a-z]+\s*=|javascript:/i;
+
+export function renderScrolly(figures, steps, slug) {
+  const figureHtml = figures
+    .map(
+      ([key, body], i) =>
+        `<figure class="sf${i === 0 ? " on" : ""}" data-key="${esc(key)}">${body.join("\n")}</figure>`,
+    )
+    .join("\n");
+  const stepHtml = steps
+    .map(([key, body]) => `<div class="ss" data-figure="${esc(key)}">${render(body.join("\n"))}</div>`)
+    .join("\n");
+  return `<section class="scrolly" id="scrolly-${esc(slug)}">
+<div class="scrolly-figs">${figureHtml}</div>
+<div class="scrolly-steps">${stepHtml}</div>
+</section>`;
+}
+
+/**
+ * Pull every scrolly block out of the markdown, returning the source with each block replaced by
+ * its rendered HTML and a sentinel that `render()` leaves alone.
+ *
+ * Done as a PRE-PASS rather than inside `render()` because `render()` is line-based and stateful,
+ * and threading a second nesting level through it is where a hand-rolled parser stops being
+ * readable — which is the one property this file is built around.
+ */
+export function extractScrolly(md, slug) {
+  const lines = md.split("\n");
+  const out = [];
+  const blocks = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    if (!SCROLLY_OPEN.test(lines[i] ?? "")) {
+      out.push(lines[i]);
+      i += 1;
+      continue;
+    }
+    i += 1;
+    const figures = [];
+    const steps = [];
+    let current = null;
+    let closed = false;
+
+    while (i < lines.length) {
+      const line = lines[i] ?? "";
+      const d = SCROLLY_DIRECTIVE.exec(line);
+      if (d) {
+        current = [d[1], d[2], []];
+        (d[1] === "figure" ? figures : steps).push([d[2], current[2]]);
+        i += 1;
+        continue;
+      }
+      if (SCROLLY_CLOSE.test(line)) {
+        closed = true;
+        i += 1;
+        break;
+      }
+      if (current) current[2].push(line);
+      i += 1;
+    }
+
+    // An unclosed block would silently swallow the rest of the explainer — every heading, every
+    // paragraph — and publish a page that simply stops. Louder than that: fail the build.
+    if (!closed) throw new Error(`${slug}: a :::scrolly block is never closed`);
+    if (figures.length === 0 || steps.length === 0)
+      throw new Error(`${slug}: a :::scrolly block needs at least one :::figure and one :::step`);
+
+    const keys = new Set(figures.map(([k]) => k));
+    for (const [k] of steps) {
+      // A typo here is invisible at runtime — the step scrolls past and the figure never changes,
+      // which reads as a design choice rather than as a bug.
+      if (!keys.has(k)) throw new Error(`${slug}: :::step ${k} has no matching :::figure`);
+    }
+    for (const [k, body] of figures) {
+      if (FIGURE_FORBIDDEN.test(body.join("\n")))
+        throw new Error(
+          `${slug}: figure "${k}" contains a script, an inline event handler or a javascript: URL. ` +
+            "Figure bodies are emitted raw so an SVG renders, and explainers are built from ingested content (§4), " +
+            "so this would be an XSS on the hub's own origin.",
+        );
+    }
+
+    blocks.push(renderScrolly(figures, steps, `${slug}-${blocks.length}`));
+    out.push(`SCROLLYBLOCK${blocks.length - 1}`);
+  }
+
+  return { md: out.join("\n"), blocks };
+}
+
+/** Put the rendered blocks back after `render()` has run over everything else. */
+export function restoreScrolly(html, blocks) {
+  return html.replace(
+    /<p>SCROLLYBLOCK(\d+)<\/p>|SCROLLYBLOCK(\d+)/g,
+    (_, a, b) => blocks[Number(a ?? b)] ?? "",
+  );
+}
+
+/** Inlined into any page that contains a scrolly block, and into no other page. */
+const SCROLLY_ASSETS = `<style>
+.scrolly{max-width:none;margin:3rem 0}
+.scrolly-figs{position:sticky;top:0;height:60vh;display:grid;place-items:center;margin-bottom:-60vh}
+.sf{margin:0;opacity:0;transition:opacity .35s;grid-area:1/1;max-width:100%}
+.sf.on{opacity:1}
+.ss{min-height:80vh;display:flex;align-items:center}
+.ss>*{background:var(--bg);padding:1rem 1.25rem;border:1px solid var(--rule);border-radius:6px;max-width:32rem;margin:0 auto}
+@media(prefers-reduced-motion:reduce){.sf{transition:none}}
+@media print{.scrolly-figs{position:static;height:auto;margin:0}.sf{opacity:1;grid-area:auto}.ss{min-height:0;display:block}}
+</style>
+<script>
+// Twenty lines instead of a library. rootMargin puts the trigger line at the middle of the
+// viewport, so a step becomes current when it reaches the centre rather than when it appears.
+for (const s of document.querySelectorAll(".scrolly")) {
+  const figs = s.querySelectorAll(".sf");
+  const io = new IntersectionObserver(
+    (entries) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        const key = e.target.dataset.figure;
+        for (const f of figs) f.classList.toggle("on", f.dataset.key === key);
+      }
+    },
+    { rootMargin: "-50% 0px -50% 0px" },
+  );
+  for (const step of s.querySelectorAll(".ss")) io.observe(step);
+}
+</script>`;
+
+const page = (title, body, canonical, assets = "") => `<!doctype html>
 <html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(title)}</title>
@@ -130,6 +309,7 @@ blockquote{margin:1.5rem 0;padding-left:1rem;border-left:3px solid var(--rule);c
 .meta{color:var(--mute);font-size:.9rem;border-bottom:1px solid var(--rule);padding-bottom:1rem;margin-bottom:2rem}
 nav{margin-bottom:2rem;font-size:.9rem}
 </style>
+${assets}
 ${body}
 `;
 
@@ -160,12 +340,17 @@ export function buildAll(srcDir = SRC, outDir = OUT) {
     // removed from the body — otherwise it renders twice, once as provenance and once as a
     // stray paragraph under the headline.
     const body = md.replace(/^_?Last verified:?.*$/im, "");
+    // P15.10: scrolly blocks come out first, so `render()` sees ordinary markdown and stays the
+    // readable line-based loop it is. The assets are inlined ONLY on a page that has one — an
+    // explainer of plain prose stays exactly the file it was.
+    const { md: prose, blocks } = extractScrolly(body, slug);
     writeFileSync(
       join(outDir, slug, "index.html"),
       page(
         title,
-        `<nav><a href="/surfaces/">← all surfaces</a></nav>\n<div class="meta">Last verified ${esc(verified[1].trim())}</div>\n${render(body)}`,
+        `<nav><a href="/surfaces/">← all surfaces</a></nav>\n<div class="meta">Last verified ${esc(verified[1].trim())}</div>\n${restoreScrolly(render(prose), blocks)}`,
         `/surfaces/${slug}/`,
+        blocks.length ? SCROLLY_ASSETS : "",
       ),
     );
     pages.push({ slug, title, verified: verified[1].trim() });
